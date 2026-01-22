@@ -21,17 +21,8 @@ from dotenv import load_dotenv
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 from tqdm import tqdm
 
-# ---------------------- Pricing (per 1K tokens) ---------------------- #
-OPENAI_PRICING = {
-    "gpt-4.1": (5.0, 15.0),
-    "gpt-4.1-mini": (0.15, 0.60),
-}
-
-ANTHROPIC_PRICING = {
-    "claude-3-5-sonnet-latest": (3.0, 15.0),
-    "claude-3-5-haiku-latest": (1.0, 5.0),
-    "claude-3-haiku-20240307": (0.25, 1.25),
-}
+# ---------------------- Pricing (loaded from JSON per 1M tokens) ---------------------- #
+PRICING_TABLE: Dict[str, Dict[str, tuple[float, float]]] = {"openai": {}, "anthropic": {}}
 
 SYSTEM_PROMPT = (
     "You are a strict evaluator. Score the model response against the rubric. "
@@ -79,9 +70,34 @@ def provider_for_model(model: str) -> str:
     return "openai"
 
 
+def load_pricing(pricing_path: Path) -> None:
+    """Populate PRICING_TABLE from a JSON file with USD_per_1M_tokens."""
+    global PRICING_TABLE
+    PRICING_TABLE = {"openai": {}, "anthropic": {}}
+    if not pricing_path.exists():
+        return
+    data = json.loads(pricing_path.read_text(encoding="utf-8"))
+    # OpenAI
+    openai_models = data.get("openai", {}).get("models", {})
+    for name, prices in openai_models.items():
+        input_price = prices.get("input")
+        output_price = prices.get("output")
+        if input_price is None or output_price is None:
+            continue
+        # Convert per 1M tokens to per token
+        PRICING_TABLE["openai"][name] = (input_price / 1_000_000, output_price / 1_000_000)
+    # Anthropic
+    anthropic_models = data.get("anthropic", {}).get("models", {})
+    for name, prices in anthropic_models.items():
+        input_price = prices.get("base_input")
+        output_price = prices.get("output")
+        if input_price is None or output_price is None:
+            continue
+        PRICING_TABLE["anthropic"][name] = (input_price / 1_000_000, output_price / 1_000_000)
+
+
 def estimate_cost(provider: str, model: str, prompt_tokens: int, completion_tokens: int) -> Optional[float]:
-    tables = {"openai": OPENAI_PRICING, "anthropic": ANTHROPIC_PRICING}
-    table = tables.get(provider, {})
+    table = PRICING_TABLE.get(provider, {})
     price = table.get(model)
     if price is None:
         for name, val in table.items():
@@ -91,7 +107,7 @@ def estimate_cost(provider: str, model: str, prompt_tokens: int, completion_toke
     if price is None:
         return None
     in_price, out_price = price
-    return (prompt_tokens / 1000) * in_price + (completion_tokens / 1000) * out_price
+    return prompt_tokens * in_price + completion_tokens * out_price
 
 
 @dataclass
@@ -288,12 +304,14 @@ def aggregate(responses: List[Dict[str, Any]], judgements: List[Dict[str, Any]])
         stats = per_model[model]
         stats.setdefault("scores", [])
         stats.setdefault("hard_pass", [])
-        score = row.get("score")
-        if isinstance(score, (int, float)):
-            stats["scores"].append(float(score))
         hard_pass = row.get("hard_pass")
+        score = row.get("score")
+        # If hard_pass is True, treat quality score as zero per requirement.
         if isinstance(hard_pass, bool):
             stats["hard_pass"].append(hard_pass)
+        if isinstance(score, (int, float)):
+            adjusted_score = 0.0 if hard_pass else float(score)
+            stats["scores"].append(adjusted_score)
 
     aggregates: List[Dict[str, Any]] = []
     for model, stats in per_model.items():
@@ -413,6 +431,43 @@ def scatter_latency_quality(models: List[Dict[str, Any]], out_path: Path) -> Non
     plt.close(fig)
 
 
+def scatter_cost_hardpass(models: List[Dict[str, Any]], out_path: Path) -> None:
+    if not models:
+        return
+    fig, ax = plt.subplots(figsize=(8, 6))
+    xs = []
+    ys = []
+    labels = []
+    for m in models:
+        if m["cost_mean"] is None or m["hard_pass_rate"] is None:
+            continue
+        xs.append(m["cost_mean"])
+        ys.append(m["hard_pass_rate"])
+        labels.append(m["model"])
+    if not xs:
+        plt.close(fig)
+        return
+    ax.scatter(xs, ys, s=200, alpha=0.7, edgecolor="k")
+    for x, y, label in zip(xs, ys, labels):
+        ax.text(x, y, label, fontsize=9, ha="center", va="center")
+    ax.set_xlabel("Cost (mean, USD)")
+    ax.set_ylabel("Hard pass rate")
+    ax.set_title("Cost vs Hard-pass rate")
+
+    frontier = pareto_frontier(models, "cost_mean", "hard_pass_rate")
+    if frontier:
+        fx = [p["cost_mean"] for p in frontier]
+        fy = [p["hard_pass_rate"] for p in frontier]
+        ax.plot(fx, fy, "r--", label="Pareto frontier (cost-hardpass)")
+        ax.scatter(fx, fy, s=80, facecolors="none", edgecolors="red", linewidths=2)
+        ax.legend()
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Collect responses then judge them.")
     parser.add_argument("--dataset", default="data/dataset_simple.jsonl", help="Path to JSONL dataset.")
@@ -428,6 +483,11 @@ def main() -> None:
     )
     parser.add_argument("--max-tokens", type=int, default=512, help="Max generation tokens per model.")
     parser.add_argument("--timeout", type=float, default=30.0, help="HTTP timeout seconds.")
+    parser.add_argument(
+        "--pricing",
+        default="data/pricing_rates_usd_per_1m_tokens_2026-01-22.json",
+        help="Path to pricing JSON (USD_per_1M_tokens).",
+    )
     args = parser.parse_args()
 
     dotenv_path = None
@@ -459,6 +519,7 @@ def main() -> None:
 
     dataset_path = Path(args.dataset)
     dataset_rows = load_dataset(dataset_path)
+    load_pricing(Path(args.pricing))
     if args.case_id:
         dataset_rows = [row for row in dataset_rows if row.get("case_id") == args.case_id]
         if not dataset_rows:
@@ -615,6 +676,7 @@ def main() -> None:
     models = aggregate(collect_rows, judgements_rows)
     scatter_cost_quality(models, plots_dir / "cost_quality.png")
     scatter_latency_quality(models, plots_dir / "latency_quality.png")
+    scatter_cost_hardpass(models, plots_dir / "cost_hardpass.png")
 
 
 if __name__ == "__main__":
