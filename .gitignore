@@ -1,5 +1,5 @@
 # Local secrets
-config/.env
+/API_configs/
 
 # Run outputs
 outputs/
