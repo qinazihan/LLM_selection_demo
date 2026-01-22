@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 import httpx
+import matplotlib.pyplot as plt
+import numpy as np
 from dotenv import load_dotenv
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 from tqdm import tqdm
@@ -258,6 +260,159 @@ def save_jsonl(rows: Iterable[Dict[str, Any]], path: Path) -> None:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+# ---------------------- Plotting helpers ---------------------- #
+def percentile(arr: List[float], pct: float) -> Optional[float]:
+    if not arr:
+        return None
+    return float(np.percentile(arr, pct))
+
+
+def aggregate(responses: List[Dict[str, Any]], judgements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    per_model: Dict[str, Dict[str, Any]] = {}
+    for row in responses:
+        model = row.get("model")
+        if not model:
+            continue
+        stats = per_model.setdefault(model, {"costs": [], "latencies": []})
+        cost = row.get("cost_usd")
+        if isinstance(cost, (int, float)):
+            stats["costs"].append(float(cost))
+        lat = row.get("latency_s")
+        if isinstance(lat, (int, float)):
+            stats["latencies"].append(float(lat))
+
+    for row in judgements:
+        model = row.get("model")
+        if not model or model not in per_model:
+            continue
+        stats = per_model[model]
+        stats.setdefault("scores", [])
+        stats.setdefault("hard_pass", [])
+        score = row.get("score")
+        if isinstance(score, (int, float)):
+            stats["scores"].append(float(score))
+        hard_pass = row.get("hard_pass")
+        if isinstance(hard_pass, bool):
+            stats["hard_pass"].append(hard_pass)
+
+    aggregates: List[Dict[str, Any]] = []
+    for model, stats in per_model.items():
+        costs = stats.get("costs", [])
+        lats = stats.get("latencies", [])
+        scores = stats.get("scores", [])
+        passes = stats.get("hard_pass", [])
+        aggregates.append(
+            {
+                "model": model,
+                "cost_mean": float(np.mean(costs)) if costs else None,
+                "lat_mean": float(np.mean(lats)) if lats else None,
+                "lat_p95": percentile(lats, 95),
+                "score_mean": float(np.mean(scores)) if scores else None,
+                "hard_pass_rate": (sum(passes) / len(passes)) if passes else None,
+                "n_samples": len(scores) or len(lats) or len(costs),
+            }
+        )
+    return aggregates
+
+
+def pareto_frontier(points: List[Dict[str, Any]], cost_key: str, quality_key: str) -> List[Dict[str, Any]]:
+    pts = [p for p in points if p.get(cost_key) is not None and p.get(quality_key) is not None]
+    pts = sorted(pts, key=lambda x: (x[cost_key], -x[quality_key]))
+    frontier: List[Dict[str, Any]] = []
+    best_quality = -float("inf")
+    for p in pts:
+        q = p[quality_key]
+        if q > best_quality:
+            frontier.append(p)
+            best_quality = q
+    return frontier
+
+
+def scatter_cost_quality(models: List[Dict[str, Any]], out_path: Path) -> None:
+    if not models:
+        return
+    fig, ax = plt.subplots(figsize=(8, 6))
+    xs = []
+    ys = []
+    sizes = []
+    labels = []
+    for m in models:
+        if m["cost_mean"] is None or m["score_mean"] is None:
+            continue
+        xs.append(m["cost_mean"])
+        ys.append(m["score_mean"])
+        sizes.append(300 * (m["lat_mean"] or 0.5))
+        labels.append(m["model"])
+    if not xs:
+        plt.close(fig)
+        return
+    ax.scatter(xs, ys, s=sizes, alpha=0.6, edgecolor="k")
+    for x, y, label in zip(xs, ys, labels):
+        ax.text(x, y, label, fontsize=9, ha="center", va="center")
+    ax.set_xlabel("Cost (mean, USD)")
+    ax.set_ylabel("Quality (mean score)")
+    ax.set_title("Cost vs Quality (bubble = avg latency)")
+
+    frontier = pareto_frontier(models, "cost_mean", "score_mean")
+    if frontier:
+        fx = [p["cost_mean"] for p in frontier]
+        fy = [p["score_mean"] for p in frontier]
+        ax.plot(fx, fy, "r--", label="Pareto frontier")
+        ax.scatter(fx, fy, s=80, facecolors="none", edgecolors="red", linewidths=2)
+        ax.legend()
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def scatter_latency_quality(models: List[Dict[str, Any]], out_path: Path) -> None:
+    if not models:
+        return
+    fig, ax = plt.subplots(figsize=(8, 6))
+    xs = []
+    ys = []
+    sizes = []
+    colors = []
+    labels = []
+    for m in models:
+        lat = m["lat_p95"] if m["lat_p95"] is not None else m["lat_mean"]
+        if lat is None or m["score_mean"] is None:
+            continue
+        xs.append(lat)
+        ys.append(m["score_mean"])
+        cost = m["cost_mean"]
+        colors.append(cost if cost is not None else 0.0)
+        sizes.append(300)
+        labels.append(m["model"])
+    if not xs:
+        plt.close(fig)
+        return
+    sc = ax.scatter(xs, ys, s=sizes, c=colors, cmap="viridis", alpha=0.7, edgecolor="k")
+    cbar = fig.colorbar(sc, ax=ax)
+    cbar.set_label("Cost (mean USD)")
+    for x, y, label in zip(xs, ys, labels):
+        ax.text(x, y, label, fontsize=9, ha="center", va="center")
+    ax.set_xlabel("Latency (p95 seconds)")
+    ax.set_ylabel("Quality (mean score)")
+    ax.set_title("Latency vs Quality (color = cost)")
+
+    frontier = pareto_frontier(models, "lat_p95", "score_mean")
+    if frontier:
+        fx = [p["lat_p95"] for p in frontier if p["lat_p95"] is not None]
+        fy = [p["score_mean"] for p in frontier if p["lat_p95"] is not None]
+        if fx and fy:
+            ax.plot(fx, fy, "r--", label="Pareto frontier (lat-quality)")
+            ax.scatter(fx, fy, s=80, facecolors="none", edgecolors="red", linewidths=2)
+            ax.legend()
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Collect responses then judge them.")
     parser.add_argument("--dataset", default="data/dataset_simple.jsonl", help="Path to JSONL dataset.")
@@ -371,6 +526,7 @@ def main() -> None:
 
     # -------- Judge --------
     case_map = load_case_map(dataset_path)
+    judgements_rows: List[Dict[str, Any]] = []
     for resp_row in tqdm(iter_jsonl(collect_out_path), desc="Judging", unit="resp"):
         raw_error = None
         if "__parse_error__" in resp_row:
@@ -451,7 +607,14 @@ def main() -> None:
             row_out["error"] = str(exc)
             row_out["error_tags"] = ["judge_call_failed"]
 
+        judgements_rows.append(row_out)
         save_jsonl([row_out], judgements_out_path)
+
+    # -------- Plots --------
+    plots_dir = Path("outputs") / dataset_stem / "plots"
+    models = aggregate(collect_rows, judgements_rows)
+    scatter_cost_quality(models, plots_dir / "cost_quality.png")
+    scatter_latency_quality(models, plots_dir / "latency_quality.png")
 
 
 if __name__ == "__main__":

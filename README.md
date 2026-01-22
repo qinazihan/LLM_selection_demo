@@ -10,3 +10,7 @@ python scripts/run_judge.py --dataset /mnt/data/dataset_simple.jsonl --responses
 Run end-to-end (collect + judge in one):
 python scripts/collect_and_judge.py --dataset data/dataset_simple.jsonl
 (outputs land in outputs/<dataset-stem>/<dataset-stem>_responses.jsonl and ..._judgements.jsonl by default)
+
+Plots (now generated automatically by collect_and_judge):
+- Cost vs Quality (bubble = avg latency) saved to outputs/<dataset-stem>/plots/cost_quality.png
+- Latency vs Quality (color = cost) saved to outputs/<dataset-stem>/plots/latency_quality.png
