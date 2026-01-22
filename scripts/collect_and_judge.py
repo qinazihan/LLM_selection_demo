@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import re
 import time
@@ -277,24 +276,6 @@ def save_jsonl(rows: Iterable[Dict[str, Any]], path: Path) -> None:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def place_labels(xs: List[float], ys: List[float], labels: List[str], dy: float, base_offset: float = -0.35, min_sep: float = 0.08) -> List[float]:
-    """
-    Simple vertical offsetter to reduce label overlap. Offsets are applied along y.
-    base_offset is a multiplier of dy; min_sep is absolute y distance threshold.
-    """
-    placed: List[Tuple[float, float]] = []
-    result: List[float] = []
-    for x, y in zip(xs, ys):
-        y_off = y + base_offset * dy
-        attempts = 0
-        while any(math.hypot(x - px, y_off - py) < min_sep for px, py in placed) and attempts < 20:
-            y_off -= 0.1 * dy
-            attempts += 1
-        placed.append((x, y_off))
-        result.append(y_off)
-    return result
-
-
 # ---------------------- Plotting helpers ---------------------- #
 def percentile(arr: List[float], pct: float) -> Optional[float]:
     if not arr:
@@ -406,12 +387,11 @@ def scatter_cost_quality(models: List[Dict[str, Any]], out_path: Path) -> None:
     sc = ax.scatter(xs, ys, s=200, c=colors, cmap="viridis", alpha=0.7, edgecolor="k")
     cbar = fig.colorbar(sc, ax=ax)
     cbar.set_label("Latency (mean seconds)")
-    y_positions = place_labels(xs, ys, labels, dy)
-    for x, y_pos, label in zip(xs, y_positions, labels):
-        ax.text(x, y_pos, label, fontsize=9, fontweight="bold", ha="center", va="top")
+    for x, y, label in zip(xs, ys, labels):
+        ax.text(x, y - dy * 0.35, label, fontsize=9, fontweight="bold", ha="center", va="top")
     ax.set_xlabel("Cost (mean, USD, log scale)")
     ax.set_ylabel("Quality (mean score)")
-    ax.set_title("Cost vs Quality (color = avg latency)")
+    ax.set_title("Cost vs Quality")
     ax.set_xscale("log")
 
     frontier = pareto_frontier(models, "cost_mean", "score_mean")
@@ -420,7 +400,7 @@ def scatter_cost_quality(models: List[Dict[str, Any]], out_path: Path) -> None:
         fy = [p["score_mean"] for p in frontier]
         ax.plot(fx, fy, "r--", label="Pareto frontier")
         ax.scatter(fx, fy, s=80, facecolors="none", edgecolors="red", linewidths=2)
-        ax.legend()
+        ax.legend(loc="upper left")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
@@ -459,12 +439,11 @@ def scatter_latency_quality(models: List[Dict[str, Any]], out_path: Path) -> Non
     sc = ax.scatter(xs, ys, s=sizes, c=colors, cmap="viridis", alpha=0.7, edgecolor="k")
     cbar = fig.colorbar(sc, ax=ax)
     cbar.set_label("Cost (mean USD)")
-    y_positions = place_labels(xs, ys, labels, dy)
-    for x, y_pos, label in zip(xs, y_positions, labels):
-        ax.text(x, y_pos, label, fontsize=9, fontweight="bold", ha="center", va="top")
+    for x, y, label in zip(xs, ys, labels):
+        ax.text(x, y - dy * 0.35, label, fontsize=9, fontweight="bold", ha="center", va="top")
     ax.set_xlabel("Latency (mean seconds)")
     ax.set_ylabel("Quality (mean score)")
-    ax.set_title("Latency vs Quality (color = cost)")
+    ax.set_title("Latency vs Quality")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
@@ -496,9 +475,8 @@ def scatter_cost_hardpass(models: List[Dict[str, Any]], out_path: Path) -> None:
     ax.set_xlim(xmin_adj, xmax_adj)
     ax.set_ylim(0, 1.1)
     ax.scatter(xs, ys, s=200, alpha=0.7, edgecolor="k")
-    y_positions = place_labels(xs, ys, labels, dy, min_sep=0.05)
-    for x, y_pos, label in zip(xs, y_positions, labels):
-        ax.text(x, y_pos, label, fontsize=9, fontweight="bold", ha="center", va="top")
+    for x, y, label in zip(xs, ys, labels):
+        ax.text(x, y - dy * 0.7, label, fontsize=9, fontweight="bold", ha="center", va="top")
     ax.set_xlabel("Cost (mean, USD, log scale)")
     ax.set_ylabel("Hard pass rate")
     ax.set_title("Cost vs Hard-pass rate")
