@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import re
 import textwrap
 from pathlib import Path
 
@@ -18,12 +19,144 @@ def load_jsonl(path: Path) -> list[dict]:
 
 
 def format_wrapped(title: str, text: str, width: int = 96, indent: int = 2) -> str:
-    wrapped = textwrap.fill(
-        text,
-        width=width - indent,
+    """Wrap text while preserving blank lines and bullets for readability."""
+    base_wrapper = textwrap.TextWrapper(
+        width=width,
+        initial_indent=" " * indent,
         subsequent_indent=" " * indent,
+        replace_whitespace=False,
+        drop_whitespace=False,
+        break_long_words=False,
     )
-    return f"{title}:\n{textwrap.indent(wrapped, ' ' * indent)}"
+    bullet_wrapper = textwrap.TextWrapper(
+        width=width,
+        initial_indent=" " * indent + "- ",
+        subsequent_indent=" " * (indent + 2),
+        replace_whitespace=False,
+        drop_whitespace=False,
+        break_long_words=False,
+    )
+
+    lines: list[str] = []
+    paragraph: list[str] = []
+
+    def flush_paragraph() -> None:
+        if not paragraph:
+            return
+        combined = " ".join(part.strip() for part in paragraph if part.strip())
+        if combined:
+            lines.append(base_wrapper.fill(combined))
+        paragraph.clear()
+
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+
+        if not stripped:
+            flush_paragraph()
+            lines.append("")
+            continue
+
+        if stripped.startswith(("- ", "* ")):
+            flush_paragraph()
+            content = stripped[2:].lstrip()
+            lines.append(bullet_wrapper.fill(content))
+            continue
+
+        number_match = re.match(r"(\d+[\.\)])\s+(.*)", stripped)
+        if number_match:
+            flush_paragraph()
+            prefix, content = number_match.groups()
+            prefix_len = len(prefix) + 1
+            numbered_wrapper = textwrap.TextWrapper(
+                width=width,
+                initial_indent=" " * indent + prefix + " ",
+                subsequent_indent=" " * (indent + prefix_len),
+                replace_whitespace=False,
+                drop_whitespace=False,
+                break_long_words=False,
+            )
+            lines.append(numbered_wrapper.fill(content))
+            continue
+
+        paragraph.append(stripped)
+
+    flush_paragraph()
+
+    return f"{title}:\n" + "\n".join(lines)
+
+
+def format_expected(title: str, text: str, width: int = 96, indent: int = 2) -> str:
+    """Render expected answers with bullets when possible for quick scanning."""
+    if not text.strip():
+        return f"{title}:"
+
+    base_wrapper = textwrap.TextWrapper(
+        width=width,
+        initial_indent=" " * indent,
+        subsequent_indent=" " * indent,
+        replace_whitespace=False,
+        drop_whitespace=False,
+        break_long_words=False,
+    )
+    bullet_wrapper = textwrap.TextWrapper(
+        width=width,
+        initial_indent=" " * indent + "- ",
+        subsequent_indent=" " * (indent + 2),
+        replace_whitespace=False,
+        drop_whitespace=False,
+        break_long_words=False,
+    )
+
+    intro = ""
+    remainder = text.strip()
+
+    colon_split = re.split(r":\s+", remainder, maxsplit=1)
+    if len(colon_split) == 2:
+        intro, remainder = colon_split
+    else:
+        intro = remainder
+        remainder = ""
+
+    bullet_parts: list[str] = []
+    final_notes: list[str] = []
+
+    if remainder:
+        bullet_parts = re.split(r";\s+", remainder)
+    else:
+        bullet_parts = []
+
+    processed_bullets: list[str] = []
+    for part in bullet_parts:
+        trimmed = part.strip(" ;")
+        if not trimmed:
+            continue
+        note_match = re.search(r"(It must not.*)", trimmed)
+        if note_match and note_match.start() != 0:
+            main = trimmed[: note_match.start()].strip(" .")
+            note = note_match.group(1).strip()
+            if main:
+                processed_bullets.append(main)
+            if note:
+                final_notes.append(note)
+        else:
+            processed_bullets.append(trimmed)
+
+    lines: list[str] = [f"{title}:"]
+    if intro:
+        lines.append(base_wrapper.fill(intro))
+
+    if processed_bullets:
+        for bullet in processed_bullets:
+            lines.append(bullet_wrapper.fill(bullet))
+
+    if not processed_bullets and intro:
+        # Fall back to plain wrapping when no bullet structure is detected.
+        lines = [f"{title}:", base_wrapper.fill(intro)]
+
+    for note in final_notes:
+        lines.append(base_wrapper.fill(note))
+
+    return "\n".join(lines)
 
 
 def format_list(title: str, items: list[str], width: int = 96, indent: int = 2) -> str:
@@ -45,7 +178,7 @@ def print_entry(entry: dict, index: int, total: int, width: int = 96) -> None:
     print(header)
     print(format_wrapped("Prompt", entry.get("prompt", ""), width=width))
     print()
-    print(format_wrapped("Expected", entry.get("expected", ""), width=width))
+    print(format_expected("Expected", entry.get("expected", ""), width=width))
 
     rubric = entry.get("rubric", {})
     if rubric:
