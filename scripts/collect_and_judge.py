@@ -135,6 +135,7 @@ def call_openai(model: str, prompt: str, base_url: str, api_key: str, max_tokens
     data = resp.json()
     message = data["choices"][0]["message"]["content"]
     usage = data.get("usage", {})
+    # print(usage)
     prompt_tokens = usage.get("prompt_tokens", 0)
     completion_tokens = usage.get("completion_tokens", 0)
     cost = estimate_cost("openai", model, prompt_tokens, completion_tokens)
@@ -161,6 +162,7 @@ def call_anthropic(model: str, prompt: str, base_url: str, api_key: str, max_tok
     data = resp.json()
     message = data["content"][0]["text"]
     usage = data.get("usage", {})
+    # print(usage)
     prompt_tokens = usage.get("input_tokens", 0)
     completion_tokens = usage.get("output_tokens", 0)
     cost = estimate_cost("anthropic", model, prompt_tokens, completion_tokens)
@@ -283,6 +285,69 @@ def percentile(arr: List[float], pct: float) -> Optional[float]:
     return float(np.percentile(arr, pct))
 
 
+def place_labels(ax, xs: List[float], ys: List[float], labels: List[str], base_offset: float) -> None:
+    """
+    Place labels with a simple force-directed pass in screen space to reduce overlap.
+    Stable on log axes; no extra deps.
+    """
+    if not xs:
+        return
+    transform = ax.transData
+    inv = transform.inverted()
+    pts = np.column_stack([xs, ys])
+    screen_pts = transform.transform(pts)
+    n = len(labels)
+    # Initial positions: nudge upward in screen space
+    base_pix = abs(transform.transform((0, base_offset))[1] - transform.transform((0, 0))[1])
+    base_pix = max(base_pix, 10)
+    positions = screen_pts.copy()
+    positions[:, 1] += base_pix
+    min_sep = 14.0  # desired minimum separation in pixels
+    step = 0.01
+    for _ in range(200):
+        disp = np.zeros_like(positions)
+        # Repel labels from each other
+        for i in range(n):
+            delta = positions[i] - positions
+            dist2 = np.sum(delta * delta, axis=1)
+            mask = dist2 > 1e-6
+            delta = delta[mask]
+            dist2 = dist2[mask]
+            close = dist2 < (min_sep * min_sep)
+            if not np.any(close):
+                continue
+            force = (delta[close] / (dist2[close][:, None] + 1e-6)) * ((min_sep * min_sep - dist2[close])[:, None])
+            disp[i] += force.sum(axis=0)
+        # Repel labels from their anchor points
+        delta_anchor = positions - screen_pts
+        dist2_anchor = np.sum(delta_anchor * delta_anchor, axis=1)
+        close_anchor = dist2_anchor < (min_sep * min_sep)
+        if np.any(close_anchor):
+            force_anchor = (delta_anchor[close_anchor] / (dist2_anchor[close_anchor][:, None] + 1e-6)) * (
+                (min_sep * min_sep - dist2_anchor[close_anchor])[:, None]
+            )
+            disp[close_anchor] += force_anchor
+        positions += disp * step
+        # Keep x near the anchor to avoid large sideways drift
+        positions[:, 0] = screen_pts[:, 0]
+    # Explicitly place gpt-5 below its point to reduce collisions
+    for idx, label in enumerate(labels):
+        if label == "gpt-5":
+            positions[idx, 0] = screen_pts[idx, 0]
+            positions[idx, 1] = screen_pts[idx, 1] - base_pix
+    data_coords = inv.transform(positions)
+    for (x_new, y_new), label in zip(data_coords, labels):
+        ax.text(
+            x_new,
+            y_new,
+            label,
+            fontsize=9,
+            fontweight="bold",
+            ha="center",
+            va="center",
+        )
+
+
 def aggregate(responses: List[Dict[str, Any]], judgements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     per_model: Dict[str, Dict[str, Any]] = {}
     for row in responses:
@@ -387,8 +452,7 @@ def scatter_cost_quality(models: List[Dict[str, Any]], out_path: Path) -> None:
     sc = ax.scatter(xs, ys, s=200, c=colors, cmap="viridis", alpha=0.7, edgecolor="k")
     cbar = fig.colorbar(sc, ax=ax)
     cbar.set_label("Latency (mean seconds)")
-    for x, y, label in zip(xs, ys, labels):
-        ax.text(x, y - dy * 0.35, label, fontsize=9, fontweight="bold", ha="center", va="top")
+    place_labels(ax, xs, ys, labels, dy * 0.4)
     ax.set_xlabel("Cost (mean, USD, log scale)")
     ax.set_ylabel("Quality (mean score)")
     ax.set_title("Cost vs Quality")
@@ -439,8 +503,7 @@ def scatter_latency_quality(models: List[Dict[str, Any]], out_path: Path) -> Non
     sc = ax.scatter(xs, ys, s=sizes, c=colors, cmap="viridis", alpha=0.7, edgecolor="k")
     cbar = fig.colorbar(sc, ax=ax)
     cbar.set_label("Cost (mean USD)")
-    for x, y, label in zip(xs, ys, labels):
-        ax.text(x, y - dy * 0.35, label, fontsize=9, fontweight="bold", ha="center", va="top")
+    place_labels(ax, xs, ys, labels, dy * 0.4)
     ax.set_xlabel("Latency (mean seconds)")
     ax.set_ylabel("Quality (mean score)")
     ax.set_title("Latency vs Quality")
@@ -475,8 +538,7 @@ def scatter_cost_hardpass(models: List[Dict[str, Any]], out_path: Path) -> None:
     ax.set_xlim(xmin_adj, xmax_adj)
     ax.set_ylim(0, 1.1)
     ax.scatter(xs, ys, s=200, alpha=0.7, edgecolor="k")
-    for x, y, label in zip(xs, ys, labels):
-        ax.text(x, y - dy * 0.7, label, fontsize=9, fontweight="bold", ha="center", va="top")
+    place_labels(ax, xs, ys, labels, dy * 0.5)
     ax.set_xlabel("Cost (mean, USD, log scale)")
     ax.set_ylabel("Hard pass rate")
     ax.set_title("Cost vs Hard-pass rate")
@@ -504,6 +566,12 @@ def main() -> None:
     parser.add_argument("--plot-only", action="store_true", help="Only plot existing responses/judgements; skip collect/judge.")
     parser.add_argument("--max-tokens", type=int, default=512, help="Max generation tokens per model.")
     parser.add_argument("--timeout", type=float, default=30.0, help="HTTP timeout seconds.")
+    parser.add_argument(
+        "--responses-per-prompt",
+        type=int,
+        default=3,
+        help="Number of responses to collect per model per prompt (default: 3).",
+    )
     parser.add_argument(
         "--pricing",
         default="data/pricing_rates_usd_per_1m_tokens_2026-01-22.json",
@@ -582,44 +650,47 @@ def main() -> None:
             case_id = entry.get("case_id")
             for model in tqdm(model_ids, desc=f"Collecting {case_id}", unit="model", leave=False):
                 provider = provider_for_model(model)
-                try:
-                    if provider == "openai":
-                        if not openai_key:
-                            raise RuntimeError("OPENAI_API_KEY not set")
-                        result = call_openai(model, prompt, openai_base, openai_key, args.max_tokens, args.timeout)
-                    else:
-                        if not anthropic_key:
-                            raise RuntimeError("ANTHROPIC_API_KEY not set")
-                        result = call_anthropic(model, prompt, anthropic_base, anthropic_key, args.max_tokens, args.timeout)
-                    row = {
-                        "timestamp": now,
-                        "run_name": run_name,
-                        "case_id": case_id,
-                        "model": model,
-                        "provider": provider,
-                        "prompt": prompt,
-                        "response": result.response,
-                        "latency_s": result.latency_s,
-                        "prompt_tokens": result.prompt_tokens,
-                        "completion_tokens": result.completion_tokens,
-                        "cost_usd": result.cost_usd,
-                    }
-                except Exception as exc:
-                    row = {
-                        "timestamp": now,
-                        "run_name": run_name,
-                        "case_id": case_id,
-                        "model": model,
-                        "provider": provider,
-                        "prompt": prompt,
-                        "response": None,
-                        "latency_s": None,
-                        "prompt_tokens": 0,
-                        "completion_tokens": 0,
-                        "cost_usd": None,
-                        "error": str(exc),
-                    }
-                collect_rows.append(row)
+                for sample_idx in range(args.responses_per_prompt):
+                    try:
+                        if provider == "openai":
+                            if not openai_key:
+                                raise RuntimeError("OPENAI_API_KEY not set")
+                            result = call_openai(model, prompt, openai_base, openai_key, args.max_tokens, args.timeout)
+                        else:
+                            if not anthropic_key:
+                                raise RuntimeError("ANTHROPIC_API_KEY not set")
+                            result = call_anthropic(model, prompt, anthropic_base, anthropic_key, args.max_tokens, args.timeout)
+                        row = {
+                            "timestamp": now,
+                            "run_name": run_name,
+                            "case_id": case_id,
+                            "model": model,
+                            "provider": provider,
+                            "prompt": prompt,
+                            "response": result.response,
+                            "latency_s": result.latency_s,
+                            "prompt_tokens": result.prompt_tokens,
+                            "completion_tokens": result.completion_tokens,
+                            "cost_usd": result.cost_usd,
+                            "sample_idx": sample_idx,
+                        }
+                    except Exception as exc:
+                        row = {
+                            "timestamp": now,
+                            "run_name": run_name,
+                            "case_id": case_id,
+                            "model": model,
+                            "provider": provider,
+                            "prompt": prompt,
+                            "response": None,
+                            "latency_s": None,
+                            "prompt_tokens": 0,
+                            "completion_tokens": 0,
+                            "cost_usd": None,
+                            "error": str(exc),
+                            "sample_idx": sample_idx,
+                        }
+                    collect_rows.append(row)
         save_jsonl(collect_rows, collect_out_path)
     else:
         if collect_out_path.exists():
@@ -634,6 +705,7 @@ def main() -> None:
     if not plot_only:
         for resp_row in tqdm(iter_jsonl(collect_out_path), desc="Judging", unit="resp"):
             raw_error = None
+            sample_idx = resp_row.get("sample_idx")
             if "__parse_error__" in resp_row:
                 raw_error = "response_json_parse_failed"
                 case_id = None
@@ -649,6 +721,7 @@ def main() -> None:
                 "run_name": run_name,
                 "case_id": case_id,
                 "model": model,
+                "sample_idx": sample_idx,
                 "judge_model": judge_model,
                 "score": None,
                 "hard_pass": None,

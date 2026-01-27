@@ -1,6 +1,7 @@
 # Local secrets
 /API_configs/
 
+/outputs/
 # Python cache
 __pycache__/
 *.pyc
