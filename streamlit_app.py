@@ -121,7 +121,7 @@ def build_case_payload(case_id: str) -> Dict:
 def run_pipeline(
     dataset_path: Path,
     dataset_stem: str,
-    case_id: str,
+    case_id: Optional[str],
     responses_per_prompt: int,
     log_placeholder,
     stage_callback,
@@ -131,11 +131,11 @@ def run_pipeline(
         "scripts/collect_and_judge.py",
         "--dataset",
         str(dataset_path),
-        "--case-id",
-        case_id,
         "--responses-per-prompt",
         str(responses_per_prompt),
     ]
+    if case_id:
+        cmd.extend(["--case-id", case_id])
     env = os.environ.copy()
     # Hide tqdm progress bars from stdout
     env["TQDM_DISABLE"] = "1"
@@ -322,6 +322,11 @@ with st.sidebar:
     st.subheader("Template")
     template_choice = st.selectbox("Prefill fields with", ["biz_001", "it_001", "blank"])
     st.button("Apply template", on_click=apply_template, args=(template_choice,))
+    dataset_choice = st.selectbox(
+        "Dataset source",
+        ["Custom single-case (on the right)", "Sample dataset_simple.jsonl"],
+        help="Use the form below to create a single-case dataset, or run the bundled sample dataset.",
+    )
     st.subheader("Run Options")
     num_responses = st.selectbox("Responses per model", options=[1, 2, 3, 4, 5], index=2, help="Passed to --responses-per-prompt.")
     st.info("This takes minutes to run. The model responses are collected and then judged. More responses will need more time.")
@@ -342,66 +347,75 @@ with col_right:
 run_clicked = st.button("Run collect & judge", type="primary", use_container_width=True)
 
 if run_clicked:
-    case_id = st.session_state["case_id"].strip() or f"custom_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-    payload = build_case_payload(case_id)
-    if not payload["prompt"]:
-        st.error("Prompt is required.")
-    elif not payload["expected"]:
-        st.error("Expected text is required.")
-    elif not payload["rubric"]["hard_requirements"]:
-        st.error("At least one hard requirement is required.")
+    case_id_input = st.session_state["case_id"].strip()
+    if dataset_choice == "Sample dataset_simple.jsonl":
+        # Run the bundled dataset as-is (no text inputs, no filtering)
+        case_id = None
+        dataset_path = Path("data/dataset_simple.jsonl")
+        dataset_stem = dataset_path.stem
     else:
+        case_id = case_id_input or f"custom_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        payload = build_case_payload(case_id)
+        if not payload["prompt"]:
+            st.error("Prompt is required.")
+            st.stop()
+        if not payload["expected"]:
+            st.error("Expected text is required.")
+            st.stop()
+        if not payload["rubric"]["hard_requirements"]:
+            st.error("At least one hard requirement is required.")
+            st.stop()
         dataset_dir = Path("outputs/streamlit_runs")
         dataset_dir.mkdir(parents=True, exist_ok=True)
         dataset_stem = f"{case_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
         dataset_path = dataset_dir / f"{dataset_stem}.jsonl"
         dataset_path.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
 
-        status_box = st.empty()
-        status_box.info("Collecting responses...")
-        log_box = st.empty()
-        return_code, log_text = run_pipeline(
-            dataset_path,
-            dataset_stem,
-            case_id,
-            num_responses,
-            log_box,
-            stage_callback=lambda label: status_box.info(label),
-        )
-        if return_code != 0:
-            status_box.error("Pipeline failed")
-            st.error("Pipeline failed. Check log below.")
+    status_box = st.empty()
+    status_box.info("Collecting responses...")
+    log_box = st.empty()
+    return_code, log_text = run_pipeline(
+        dataset_path,
+        dataset_stem,
+        case_id,
+        num_responses,
+        log_box,
+        stage_callback=lambda label: status_box.info(label),
+    )
+    if return_code != 0:
+        status_box.error("Pipeline failed")
+        st.error("Pipeline failed. Check log below.")
+        st.code(log_text or "(empty)")
+    else:
+        status_box.success("Pipeline complete")
+        st.success("Run complete. Plots below use fresh outputs.")
+        with st.expander("Run log"):
             st.code(log_text or "(empty)")
+
+        models = load_models_data(dataset_stem)
+        if not models:
+            st.warning("No model data found; nothing to plot.")
         else:
-            status_box.success("Pipeline complete")
-            st.success("Run complete. Plots below use fresh outputs.")
-            with st.expander("Run log"):
-                st.code(log_text or "(empty)")
+            plots_dir = Path("outputs") / dataset_stem / "plots"
+            col_a, col_b, col_c = st.columns(3)
 
-            models = load_models_data(dataset_stem)
-            if not models:
-                st.warning("No model data found; nothing to plot.")
-            else:
-                plots_dir = Path("outputs") / dataset_stem / "plots"
-                col_a, col_b, col_c = st.columns(3)
+            fig_cost_quality = plot_cost_quality(models)
+            fig_latency_quality = plot_latency_quality(models)
+            fig_cost_hardpass = plot_cost_hardpass(models)
 
-                fig_cost_quality = plot_cost_quality(models)
-                fig_latency_quality = plot_latency_quality(models)
-                fig_cost_hardpass = plot_cost_hardpass(models)
+            with col_a:
+                if fig_cost_quality:
+                    st.plotly_chart(fig_cost_quality, use_container_width=True)
 
-                with col_a:
-                    if fig_cost_quality:
-                        st.plotly_chart(fig_cost_quality, use_container_width=True)
+            with col_b:
+                if fig_latency_quality:
+                    st.plotly_chart(fig_latency_quality, use_container_width=True)
 
-                with col_b:
-                    if fig_latency_quality:
-                        st.plotly_chart(fig_latency_quality, use_container_width=True)
+            with col_c:
+                if fig_cost_hardpass:
+                    st.plotly_chart(fig_cost_hardpass, use_container_width=True)
 
-                with col_c:
-                    if fig_cost_hardpass:
-                        st.plotly_chart(fig_cost_hardpass, use_container_width=True)
-
-            st.caption(
-                "Hover a point to see its label; click to focus and dim others. "
-                "Plots are recomputed each run from the newest responses/judgements."
-            )
+        st.caption(
+            "Hover a point to see its label; click to focus and dim others. "
+            "Plots are recomputed each run from the newest responses/judgements."
+        )
